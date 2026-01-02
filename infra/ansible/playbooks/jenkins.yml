@@ -1,0 +1,277 @@
+---
+- name: Configure Jenkins Server
+  hosts: jenkins
+  become: yes
+
+  tasks:
+    # -------------------------
+    # Base system
+    # -------------------------
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install base dependencies
+      apt:
+        name:
+          - ca-certificates
+          - curl
+          - gnupg
+          - unzip          # 🔥 REQUIRED for AWS CLI
+        state: present
+
+    # -------------------------
+    # Create apt keyrings directory
+    # -------------------------
+    - name: Ensure /etc/apt/keyrings exists
+      command: install -d -m 0755 /etc/apt/keyrings
+      args:
+        creates: /etc/apt/keyrings
+
+    # -------------------------
+    # Java 17
+    # -------------------------
+    - name: Install Java 17
+      apt:
+        name: openjdk-17-jdk
+        state: present
+
+    # -------------------------
+    # Jenkins
+    # -------------------------
+    - name: Download Jenkins GPG key
+      get_url:
+        url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+        dest: /etc/apt/keyrings/jenkins-keyring.asc
+        mode: "0644"
+
+    - name: Add Jenkins repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/"
+        filename: jenkins
+        state: present
+
+    - name: Install Jenkins
+      apt:
+        name: jenkins
+        state: present
+        update_cache: yes
+
+    - name: Enable and start Jenkins
+      service:
+        name: jenkins
+        state: started
+        enabled: yes
+
+    # -------------------------
+    # Docker
+    # -------------------------
+    - name: Download Docker GPG key
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        filename: docker
+        state: present
+
+    - name: Install Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Enable and start Docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    # -------------------------
+    # Jenkins Docker permission
+    # -------------------------
+    - name: Add jenkins user to docker group
+      user:
+        name: jenkins
+        groups: docker
+        append: yes
+
+    - name: Restart Jenkins to apply docker group
+      service:
+        name: jenkins
+        state: restarted
+
+    # -------------------------
+    # kubectl
+    # -------------------------
+    - name: Get latest kubectl version
+      get_url:
+        url: https://dl.k8s.io/release/stable.txt
+        dest: /tmp/k8s_version
+
+    - name: Read kubectl version
+      command: cat /tmp/k8s_version
+      register: kubectl_version
+      changed_when: false
+
+    - name: Install kubectl
+      get_url:
+        url: "https://dl.k8s.io/release/{{ kubectl_version.stdout }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: "0755"
+
+    # -------------------------
+    # AWS CLI v2
+    # -------------------------
+    - name: Download AWS CLI
+      get_url:
+        url: https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip
+        dest: /tmp/awscliv2.zip
+
+    - name: Unzip AWS CLI
+      unarchive:
+        src: /tmp/awscliv2.zip
+        dest: /tmp
+        remote_src: yes
+
+    - name: Install AWS CLI
+      command: /tmp/aws/install
+      args:
+        creates: /usr/local/bin/aws
+
+    # -------------------------
+    # Maven & Git
+    # -------------------------
+    - name: Install Maven and Git
+      apt:
+        name:
+          - maven
+          - git
+        state: present
+    
+
+
+    # -------------------------
+    # Argo CD (GitOps CD)
+    # -------------------------
+
+    - name: Create argocd namespace (idempotent)
+      command: kubectl create namespace argocd
+      register: argocd_ns
+      failed_when: false
+      changed_when: "'created' in argocd_ns.stdout"
+
+    - name: Install Argo CD core components
+      command: >
+        kubectl apply -n argocd
+        -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      register: argocd_install
+
+    - name: Wait for Argo CD server deployment
+      command: kubectl rollout status deployment/argocd-server -n argocd
+      retries: 10
+      delay: 15
+      register: rollout_status
+      until: rollout_status.rc == 0
+
+    # -------------------------
+    # Argo CD CLI
+    # -------------------------
+
+    - name: Download Argo CD CLI
+      get_url:
+        url: https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+        dest: /usr/local/bin/argocd
+        mode: "0755"
+
+    - name: Verify Argo CD CLI
+      command: argocd version --client
+      register: argocd_cli_version
+      changed_when: false
+
+    # -------------------------
+    # Argo CD UI Port Forward (background)
+    # -------------------------
+
+    - name: Start Argo CD UI port-forward on 8081
+      shell: |
+        pkill -f "kubectl port-forward svc/argocd-server" || true
+        nohup kubectl port-forward svc/argocd-server -n argocd 8081:443 --address=0.0.0.0 > /tmp/argocd-portforward.log 2>&1 &
+      async: 10
+      poll: 0
+
+
+    # =====================================================
+    # MONITORING: HELM + PROMETHEUS + GRAFANA
+    # =====================================================
+
+    # -------------------------
+    # Helm
+    # -------------------------
+    - name: Check if Helm is installed
+      command: helm version
+      register: helm_check
+      failed_when: false
+      changed_when: false
+
+    - name: Install Helm if missing
+      shell: |
+        curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      when: helm_check.rc != 0
+
+    - name: Verify Helm installation
+      command: helm version
+      changed_when: false
+
+    # -------------------------
+    # Configure kubeconfig for EKS
+    # -------------------------
+    - name: Configure kubeconfig for EKS
+      command: >
+        aws eks update-kubeconfig
+        --region {{ eks_region }}
+        --name {{ eks_cluster_name }}
+      environment:
+        HOME: /root
+
+    - name: Verify EKS connectivity
+      command: kubectl get nodes
+      changed_when: false
+
+    # -------------------------
+    # Monitoring namespace
+    # -------------------------
+    - name: Create monitoring namespace
+      command: kubectl create namespace {{ monitoring_namespace }}
+      register: monitoring_ns
+      failed_when: false
+      changed_when: "'created' in monitoring_ns.stdout"
+
+    # -------------------------
+    # Prometheus Helm repo
+    # -------------------------
+    - name: Add Prometheus Helm repository
+      command: helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      failed_when: false
+      changed_when: false
+
+    - name: Update Helm repositories
+      command: helm repo update
+      changed_when: false
+
+    # -------------------------
+    # Install Prometheus + Grafana
+    # -------------------------
+    - name: Install Prometheus & Grafana (kube-prometheus-stack)
+      command: >
+        helm upgrade --install {{ helm_release_name }}
+        prometheus-community/kube-prometheus-stack
+        -n {{ monitoring_namespace }}

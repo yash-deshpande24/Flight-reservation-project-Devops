@@ -1,0 +1,179 @@
+---
+- name: Configure SonarQube Server
+  hosts: sonarqube
+  become: yes
+
+  vars:
+    sonar_version: "25.5.0.107428"
+    sonar_db_user: linux
+    sonar_db_password: redhat
+    sonar_db_name: sonarqube
+
+  tasks:
+    # -------------------------
+    # WAIT FOR APT / DPKG LOCK (FIX ONLY)
+    # -------------------------
+    - name: Wait for apt lock to be released
+      shell: |
+        while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1; do
+          echo "Waiting for apt lock..."
+          sleep 5
+        done
+      changed_when: false
+
+    - name: Wait for dpkg lock
+      shell: |
+        while fuser /var/lib/dpkg/lock >/dev/null 2>&1; do
+          echo "Waiting for dpkg lock..."
+          sleep 5
+        done
+      changed_when: false
+
+    # -------------------------
+    # Base system & packages
+    # -------------------------
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Install Java, PostgreSQL and dependencies
+      apt:
+        name:
+          - openjdk-17-jdk
+          - unzip
+          - postgresql
+          - postgresql-contrib
+        state: present
+
+    - name: Enable and start PostgreSQL
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    # -------------------------
+    # PostgreSQL DB setup (SHELL – EXACTLY LIKE MANUAL)
+    # -------------------------
+    - name: Create SonarQube DB user if not exists
+      shell: |
+        sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='{{ sonar_db_user }}'" | grep -q 1 \
+        || sudo -u postgres psql -c "CREATE USER {{ sonar_db_user }} WITH PASSWORD '{{ sonar_db_password }}';"
+      args:
+        executable: /bin/bash
+
+    - name: Create SonarQube database if not exists
+      shell: |
+        sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='{{ sonar_db_name }}'" | grep -q 1 \
+        || sudo -u postgres psql -c "CREATE DATABASE {{ sonar_db_name }} OWNER {{ sonar_db_user }};"
+      args:
+        executable: /bin/bash
+
+    - name: Grant privileges on database
+      shell: |
+        sudo -u postgres psql -d {{ sonar_db_name }} -c "GRANT ALL PRIVILEGES ON DATABASE {{ sonar_db_name }} TO {{ sonar_db_user }};"
+        sudo -u postgres psql -d {{ sonar_db_name }} -c "GRANT ALL PRIVILEGES ON SCHEMA public TO {{ sonar_db_user }};"
+      args:
+        executable: /bin/bash
+
+    # -------------------------
+    # Kernel tuning (REQUIRED)
+    # -------------------------
+    - name: Set vm.max_map_count
+      sysctl:
+        name: vm.max_map_count
+        value: "524288"
+        state: present
+        reload: yes
+
+    - name: Set fs.file-max
+      sysctl:
+        name: fs.file-max
+        value: "131072"
+        state: present
+        reload: yes
+
+    # -------------------------
+    # Sonar user & limits
+    # -------------------------
+    - name: Create sonar system user
+      user:
+        name: sonar
+        system: yes
+        create_home: yes
+        shell: /bin/bash
+
+    - name: Configure limits for sonar user
+      copy:
+        dest: /etc/security/limits.d/sonar.conf
+        content: |
+          sonar   -   nofile   65536
+          sonar   -   nproc    4096
+        mode: "0644"
+
+    # -------------------------
+    # SonarQube installation
+    # -------------------------
+    - name: Download SonarQube
+      get_url:
+        url: "https://binaries.sonarsource.com/Distribution/sonarqube/sonarqube-{{ sonar_version }}.zip"
+        dest: /opt/sonarqube.zip
+
+    - name: Unzip SonarQube
+      unarchive:
+        src: /opt/sonarqube.zip
+        dest: /opt/
+        remote_src: yes
+
+    - name: Move SonarQube directory
+      command: mv /opt/sonarqube-{{ sonar_version }} /opt/sonar
+      args:
+        creates: /opt/sonar
+
+    - name: Configure sonar.properties
+      blockinfile:
+        path: /opt/sonar/conf/sonar.properties
+        block: |
+          sonar.jdbc.username={{ sonar_db_user }}
+          sonar.jdbc.password={{ sonar_db_password }}
+          sonar.jdbc.url=jdbc:postgresql://localhost/{{ sonar_db_name }}
+
+    - name: Set ownership of SonarQube directory
+      file:
+        path: /opt/sonar
+        owner: sonar
+        group: sonar
+        recurse: yes
+
+    # -------------------------
+    # Start SonarQube (systemd)
+    # -------------------------
+    - name: Create SonarQube systemd service
+      copy:
+        dest: /etc/systemd/system/sonarqube.service
+        content: |
+          [Unit]
+          Description=SonarQube service
+          After=network.target postgresql.service
+
+          [Service]
+          Type=forking
+          ExecStart=/opt/sonar/bin/linux-x86-64/sonar.sh start
+          ExecStop=/opt/sonar/bin/linux-x86-64/sonar.sh stop
+          User=sonar
+          Group=sonar
+          Restart=always
+          LimitNOFILE=65536
+          LimitNPROC=4096
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: "0644"
+
+    - name: Reload systemd
+      command: systemctl daemon-reexec
+
+    - name: Enable and start SonarQube
+      service:
+        name: sonarqube
+        state: started
+        enabled: yes
