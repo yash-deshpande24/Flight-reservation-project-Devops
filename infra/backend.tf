@@ -4,7 +4,7 @@ terraform {
   backend "s3" {
     bucket         = "cbz-terraform-state-prod"
     key            = "flight-reservation/infra/terraform.tfstate"
-    region         = "ap-south-1"
+    region         = "us-west-2"
     dynamodb_table = "terraform-locks"
     encrypt        = true
   }
@@ -18,8 +18,8 @@ If these already exist, skip this section.
 1️⃣ S3 bucket for state
 aws s3api create-bucket \
   --bucket cbz-terraform-state-prod \
-  --region ap-south-1 \
-  --create-bucket-configuration LocationConstraint=ap-south-1
+  --region `us-west-2` \
+  --create-bucket-configuration LocationConstraint=us-west-2
 
 
 Enable versioning:
@@ -34,7 +34,7 @@ aws dynamodb create-table \
   --attribute-definitions AttributeName=LockID,AttributeType=S \
   --key-schema AttributeName=LockID,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST \
-  --region ap-south-1
+  --region us-west-2
 
 🔄 How to migrate existing state (CRITICAL STEP)
 
